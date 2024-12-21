@@ -231,6 +231,7 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
      has_account (bool, read-only) - True is this object has an associated account.
      is_superuser (bool, read-only): True if this object has an account and that
                         account is a superuser.
+     plural_category (string) - Alias category for the plural strings of this object
 
     * Handlers available
 
@@ -304,11 +305,14 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
 
      at_object_creation() - only called once, when object is first created.
                             Object customizations go here.
+     at_object_post_creation() - only called once, when object is first created.
+                            Additional setup involving e.g. prototype-set attributes can go here.
      at_object_delete() - called just before deleting an object. If returning
                             False, deletion is aborted. Note that all objects
                             inside a deleted object are automatically moved
                             to their <home>, they don't need to be removed here.
-
+     at_object_post_spawn() - called when object is spawned from a prototype or updated
+                            by the spawner to apply prototype changes.
      at_init()            - called whenever typeclass is cached from memory,
                             at least once every server restart/reload
      at_first_save()
@@ -379,6 +383,7 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
 
      at_look(target, **kwargs)
      at_desc(looker=None)
+     at_rename(oldname, newname)
 
 
     """
@@ -394,6 +399,9 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
 
     objects = ObjectManager()
 
+    # Used by get_display_desc when self.db.desc is None
+    default_description = _("You see nothing special.")
+
     # populated by `return_appearance`
     appearance_template = """
 {header}
@@ -404,6 +412,8 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
 {things}
 {footer}
     """
+
+    plural_category = "plural_key"
     # on-object properties
 
     @lazy_property
@@ -542,11 +552,13 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
 
         """
         if isinstance(searchdata, str):
+            candidates = kwargs.get("candidates") or []
+            global_search = kwargs.get("global_search", False)
             match searchdata.lower():
                 case "me" | "self":
-                    return True, self
+                    return global_search or self in candidates, self
                 case "here":
-                    return True, self.location
+                    return global_search or self.location in candidates, self.location
         return False, searchdata
 
     def get_search_candidates(self, searchdata, **kwargs):
@@ -826,8 +838,14 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
         # replace incoming searchdata string with a potentially modified version
         searchdata = self.get_search_query_replacement(searchdata, **input_kwargs)
 
+        # get candidates
+        candidates = self.get_search_candidates(searchdata, **input_kwargs)
+
         # handle special input strings, like "me" or "here".
-        should_return, searchdata = self.get_search_direct_match(searchdata, **input_kwargs)
+        # we also want to include the identified candidates here instead of input, to account for defaults
+        should_return, searchdata = self.get_search_direct_match(
+            searchdata, **(input_kwargs | {"candidates": candidates})
+        )
         if should_return:
             # we got an actual result, return it immediately
             return [searchdata] if quiet else searchdata
@@ -846,9 +864,6 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
 
         # always use exact match for dbref/global searches
         exact = True if global_search or dbref(searchdata) else exact
-
-        # get candidates
-        candidates = self.get_search_candidates(searchdata, **input_kwargs)
 
         # do the actual search
         results = self.get_search_result(
@@ -1461,10 +1476,9 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
             if account:
                 obj.db.creator_id = account.id
 
-            # Set description if there is none, or update it if provided
-            if description or not obj.db.desc:
-                desc = description if description else "You see nothing special."
-                obj.db.desc = desc
+            # Set description if provided
+            if description:
+                obj.db.desc = description
 
         except Exception as e:
             errors.append(f"An error occurred while creating this '{key}' object: {e}")
@@ -1690,7 +1704,6 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
             obj.get_numbered_name(1, looker, key="Foobert", return_string=True, no_article=True)
                   -> "Foobert"
         """
-        plural_category = "plural_key"
         key = kwargs.get("key", self.get_display_name(looker))
         raw_key = self.name
         key = ansi.ANSIString(key)  # this is needed to allow inflection of colored names
@@ -1701,13 +1714,13 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
             # this is raised by inflect if the input is not a proper noun
             plural = key
         singular = _INFLECT.an(key)
-        if not self.aliases.get(plural, category=plural_category):
+        if not self.aliases.get(plural, category=self.plural_category):
             # we need to wipe any old plurals/an/a in case key changed in the interrim
-            self.aliases.clear(category=plural_category)
-            self.aliases.add(plural, category=plural_category)
+            self.aliases.clear(category=self.plural_category)
+            self.aliases.add(plural, category=self.plural_category)
             # save the singular form as an alias here too so we can display "an egg" and also
             # look at 'an egg'.
-            self.aliases.add(singular, category=plural_category)
+            self.aliases.add(singular, category=self.plural_category)
 
         if kwargs.get("no_article") and count == 1:
             if kwargs.get("return_string"):
@@ -1743,7 +1756,7 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
             str: The desc display string.
 
         """
-        return self.db.desc or "You see nothing special."
+        return self.db.desc or self.default_description
 
     def get_display_exits(self, looker, **kwargs):
         """
@@ -1924,9 +1937,9 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
         self.init_evennia_properties()
 
         if hasattr(self, "_createdict"):
-            # this will only be set if the utils.create function
-            # was used to create the object. We want the create
-            # call's kwargs to override the values set by hooks.
+            # this will be set if the object was created by the utils.create function
+            # or the spawner. We want these kwargs to override the values set by
+            # the initial hooks.
             cdict = self._createdict
             updates = []
             if not cdict.get("key"):
@@ -1969,6 +1982,9 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
                     self.nattributes.add(key, value)
 
             del self._createdict
+
+        # run the post-setup hook
+        self.at_object_post_creation()
 
         self.basetype_posthook_setup()
 
@@ -2027,6 +2043,15 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
         """
         pass
 
+    def at_object_post_creation(self):
+        """
+        Called once, when this object is first created and after any attributes, tags, etc.
+        that were passed to the `create_object` function or defined in a prototype have been
+        applied.
+
+        """
+        pass
+
     def at_object_delete(self):
         """
         Called just before the database object is persistently
@@ -2035,6 +2060,16 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
 
         """
         return True
+
+    def at_object_post_spawn(self, prototype=None):
+        """
+        Called when this object is spawned or updated from a prototype, after all other
+        hooks have been run.
+
+        Keyword Args:
+            prototype (dict):  The prototype that was used to spawn or update this object.
+        """
+        pass
 
     def at_init(self):
         """
@@ -2955,6 +2990,19 @@ class DefaultObject(ObjectDB, metaclass=TypeclassBase):
                 mapping=location_mapping,
             )
 
+    def at_rename(self, oldname, newname):
+        """
+        This Hook is called by @name on a successful rename.
+
+        Args:
+            oldname (str): The instance's original name.
+            newname (str): The new name for the instance.
+
+        """
+
+        # Clear plural aliases set by DefaultObject.get_numbered_name
+        self.aliases.clear(category=self.plural_category)
+
 
 #
 # Base Character object
@@ -2978,6 +3026,9 @@ class DefaultCharacter(DefaultObject):
         "delete:id({account_id}) or perm(Admin);"
         "edit:pid({account_id}) or perm(Admin)"
     )
+
+    # Used by get_display_desc when self.db.desc is None
+    default_description = _("This is a character.")
 
     @classmethod
     def get_default_lockstring(
@@ -3092,9 +3143,9 @@ class DefaultCharacter(DefaultObject):
             if locks:
                 obj.locks.add(locks)
 
-            # If no description is set, set a default description
-            if description or not obj.db.desc:
-                obj.db.desc = description if description else _("This is a character.")
+            # Set description if provided
+            if description:
+                obj.db.desc = description
 
         except Exception as e:
             errors.append(f"An error occurred while creating object '{key} object: {e}")
@@ -3305,6 +3356,9 @@ class DefaultRoom(DefaultObject):
     # Generally, a room isn't expected to HAVE a location, but maybe in some games?
     _content_types = ("room",)
 
+    # Used by get_display_desc when self.db.desc is None
+    default_description = _("This is a room.")
+
     @classmethod
     def create(
         cls,
@@ -3375,9 +3429,9 @@ class DefaultRoom(DefaultObject):
             if account:
                 obj.db.creator_id = account.id
 
-            # If no description is set, set a default description
-            if description or not obj.db.desc:
-                obj.db.desc = description if description else _("This is a room.")
+            # Set description if provided
+            if description:
+                obj.db.desc = description
 
         except Exception as e:
             errors.append(f"An error occurred while creating this '{key}' object: {e}")
@@ -3469,6 +3523,9 @@ class DefaultExit(DefaultObject):
     _content_types = ("exit",)
     exit_command = ExitCommand
     priority = 101
+
+    # Used by get_display_desc when self.db.desc is None
+    default_description = _("This is an exit.")
 
     # Helper classes and methods to implement the Exit. These need not
     # be overloaded unless one want to change the foundation for how
@@ -3584,9 +3641,9 @@ class DefaultExit(DefaultObject):
             if account:
                 obj.db.creator_id = account.id
 
-            # If no description is set, set a default description
-            if description or not obj.db.desc:
-                obj.db.desc = description if description else _("This is an exit.")
+            # Set description if provided
+            if description:
+                obj.db.desc = description
 
         except Exception as e:
             errors.append(f"An error occurred while creating this '{key}' object: {e}")

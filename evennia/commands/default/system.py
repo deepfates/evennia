@@ -12,10 +12,10 @@ import time
 import traceback
 
 import django
+import evennia
+import subprocess
 import twisted
 from django.conf import settings
-
-import evennia
 from evennia.accounts.models import AccountDB
 from evennia.scripts.taskhandler import TaskHandlerTask
 from evennia.utils import gametime, logger, search, utils
@@ -46,6 +46,11 @@ __all__ = (
     "CmdTasks",
     "CmdTickers",
 )
+
+
+class PrintRecursionError(RecursionError):
+    # custom error for recursion in print
+    pass
 
 
 class CmdReload(COMMAND_DEFAULT_CLASS):
@@ -203,7 +208,14 @@ def _run_code_snippet(
                 self.caller = caller
 
             def write(self, string):
-                self.caller.msg(text=(string.rstrip("\n"), {"type": "py_output"}))
+                try:
+                    self.caller.msg(text=(string.rstrip("\n"), {"type": "py_output"}))
+                except RecursionError:
+                    tb = traceback.extract_tb(sys.exc_info()[2])
+                    if any("print(" in frame.line for frame in tb):
+                        # We are in a print loop (likely because msg() contains a print),
+                        # exit the stdout reroute prematurely
+                        raise PrintRecursionError
 
         fake_std = FakeStd(caller)
         sys.stdout = fake_std
@@ -225,6 +237,12 @@ def _run_code_snippet(
         else:
             ret = eval(pycode_compiled, {}, available_vars)
 
+    except PrintRecursionError:
+        ret = (
+            "<<< Error: Recursive print() found (probably in custom msg()). "
+            "Since `py` reroutes `print` to `msg()`, this causes a loop. Remove `print()` "
+            "from msg-related code to resolve."
+        )
     except Exception:
         errlist = traceback.format_exc().split("\n")
         if len(errlist) > 4:
@@ -845,16 +863,26 @@ class CmdServerLoad(COMMAND_DEFAULT_CLASS):
             if not _RESOURCE:
                 import resource as _RESOURCE
 
+            env = os.environ.copy()
+            env["LC_NUMERIC"] = "C"  # use default locale instead of system locale
             loadavg = os.getloadavg()[0]
-            rmem = (
-                float(os.popen("ps -p %d -o %s | tail -1" % (pid, "rss")).read()) / 1000.0
-            )  # resident memory
-            vmem = (
-                float(os.popen("ps -p %d -o %s | tail -1" % (pid, "vsz")).read()) / 1000.0
-            )  # virtual memory
-            pmem = float(
-                os.popen("ps -p %d -o %s | tail -1" % (pid, "%mem")).read()
-            )  # % of resident memory to total
+
+            # Helper function to run the ps command with a modified environment
+            def run_ps_command(command):
+                result = subprocess.run(
+                    command, shell=True, env=env, stdout=subprocess.PIPE, text=True
+                )
+                return result.stdout.strip()
+
+            # Resident memory
+            rmem = float(run_ps_command(f"ps -p {pid} -o rss | tail -1")) / 1000.0
+
+            # Virtual memory
+            vmem = float(run_ps_command(f"ps -p {pid} -o vsz | tail -1")) / 1000.0
+
+            # Percentage of resident memory to total
+            pmem = float(run_ps_command(f"ps -p {pid} -o %mem | tail -1"))
+
             rusage = _RESOURCE.getrusage(_RESOURCE.RUSAGE_SELF)
 
             if "mem" in self.switches:
